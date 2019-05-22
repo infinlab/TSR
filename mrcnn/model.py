@@ -480,10 +480,80 @@ class PyramidROIAlign(KE.Layer):
 
 
 ############################################################
+#  Attention Layer
+############################################################
+
+def get_attention(model, filters, initial_f, symmetry_f):
+    """
+    使用对称区域构建注意力区域
+    :param model:
+    :param initial_f: [batch, num, 4, 7, 7, C]
+    :param symmetry_f: [batch, num, 4, 7, 7, C]
+    :return: [batch, num, 4, 7, 7, C]
+    """
+    initial_f = tf.cast(initial_f, 'float32')
+    symmetry_f = tf.cast(symmetry_f, 'float32')
+
+    if model == 'concat':
+        mid_f = KL.Concatenate(axis=-1)([initial_f, symmetry_f])
+    elif model == 'add':
+        mid_f = KL.Add()([initial_f, symmetry_f])
+    elif model == 'gaussian':
+        pass
+    elif model == 'embedded Gaussian':
+        pass
+    elif model == 'multiply':
+        mid_f = KL.Multiply()([initial_f, symmetry_f])
+    else:
+        mid_f = KL.Subtract()([initial_f, symmetry_f])
+    x = KL.TimeDistributed(KL.Conv2D(filters, (3, 3), padding='same', name='attention_2a', activation='sigmoid'))(mid_f)
+    x = KL.Add()([x, initial_f])
+    return x
+
+
+class AttentionLayer(KE.Layer):
+    """利用双侧的不对称性，实现注意力的检测"""
+    def __init__(self, filters=256, model='subtract', **kwargs):
+        super(AttentionLayer).__init__(**kwargs)
+        self.model = model
+        self.filters = filters
+
+    def call(self, inputs):
+        """
+
+        :param inputs:[batch, num, 8, 7, 7, C]
+        :return:[batch, num, 4, 7, 7, C]
+        """
+        original_feature = inputs
+
+        # 拆分8个box的特征[batch, num, W, H, C]
+        f_x, f_1, f_2, f_3, _f_x, _f_1, _f_2, _f_3 = tf.split(original_feature, 8, axis=2)
+
+        f = [f_x, f_1, f_2, f_3]
+        _f = [_f_x, _f_1, _f_2, _f_3]
+
+        alist = []
+        for i in range(4):
+            f[i] = tf.reshape(f[i], [f[i].shape[0], f[i].shape[1], f[i].shape[3], f[i].shape[4], f[i].shape[5]])
+            _f[i] = tf.reshape(_f[i], [_f[i].shape[0], _f[i].shape[1], _f[i].shape[3], _f[i].shape[4], _f[i].shape[5]])
+            attention = get_attention(self.model, self.filters, f[i], _f[i])
+            alist.append(attention)
+
+        # [4, batch, num, W, H, C]
+        attention = tf.stack([alist[0], alist[1], alist[2], alist[3]])
+        # [batch, 4, num, W, H, C]
+        attention = tf.transpose(attention, perm=[1, 2, 0, 3, 4, 5])
+        return attention
+
+    def compute_output_shape(self, input_shape):
+        return input_shape[:2]+4+input_shape[3:]
+
+
+############################################################
 #  Contextual reasoning Layer
 ############################################################
 
-def feature_lstm_conv(times, lstm_type, filters, kernel_size, initial_state, **kwargs):
+def feature_lstm_conv(lstm_type, filters, initial_state, **kwargs):
     """
 
     :return:
@@ -509,17 +579,18 @@ def feature_lstm_conv(times, lstm_type, filters, kernel_size, initial_state, **k
     # # [batch * num, times, H, W, C]
     #  可以输入LSTM的数据
     x = tf.transpose(initial_state, perm=[1, 0, 2, 3, 4])
+    x = tf.cast(x, 'float32')
 
     # 采用双向GRU还是单向ConvLSTM2D
     # 生成数据维度
     # [batch*num, H, W, C]
     if lstm_type == 'unidirectional':
-        lstm = KL.ConvLSTM2D(filters, kernel_size, return_sequences=False,
+        lstm = KL.ConvLSTM2D(filters, (3, 3), return_sequences=False,
                              padding='SAME', name='lstm_conv')(x)
     else:
-        lstm_f = KL.ConvLSTM2D(filters, kernel_size, return_sequences=False,
+        lstm_f = KL.ConvLSTM2D(filters, (3, 3), return_sequences=False,
                                padding='SAME', name='lstm_conv')(x)
-        lstm_b = KL.ConvLSTM2D(filters, kernel_size, return_sequences=False,
+        lstm_b = KL.ConvLSTM2D(filters, (3, 3), return_sequences=False,
                                padding='SAME', go_backwards=True, name='lstm_conv_b')(x)
         lstm = KL.Add()([lstm_f, lstm_b])
 
@@ -540,7 +611,7 @@ class ContextualReasonLayer(KE.Layer):
     outputs:
     -[batch, obj_num,(pool_weight, pool_height, channel)]
     """
-    def __init__(self, filters, kernel_size, merge_times=2, lstm_type='unidirectional', merge_type='parallel',
+    def __init__(self, filters, merge_times=2, lstm_type='unidirectional', merge_type='parallel',
                  pooling_type='ave', **kwargs):
         super(ContextualReasonLayer, self).__init__(**kwargs)
         self.merge_times = merge_times
@@ -548,13 +619,12 @@ class ContextualReasonLayer(KE.Layer):
         self.merge_type = merge_type
         self.lstm_type = lstm_type
         self.filters = filters
-        self.kernel_size = kernel_size
 
     def call(self, inputs):
         """
         n次融合感兴趣区域与上下文信息
-        :param inputs:
-        :return:
+        :param inputs: [batch, num, 4, 7, 7, C]
+        :return:[batch, num, 7, 7, C]
         """
         original_feature = inputs
 
@@ -569,9 +639,9 @@ class ContextualReasonLayer(KE.Layer):
         for i in range(self.merge_times):
             if self.merge_type == 'parallel':
                 # 分别融合3个box与Initial_state，并进行pooling
-                merge_x1 = feature_lstm_conv(2, self.lstm_type, self.filters, self.kernel_size, initial_state, f_1=f_1)
-                merge_x2 = feature_lstm_conv(2, self.lstm_type, self.filters, self.kernel_size, initial_state, f_2=f_2)
-                merge_x3 = feature_lstm_conv(2, self.lstm_type, self.filters, self.kernel_size, initial_state, f_3=f_3)
+                merge_x1 = feature_lstm_conv(self.lstm_type, self.filters, initial_state, f_1=f_1)
+                merge_x2 = feature_lstm_conv(self.lstm_type, self.filters, initial_state, f_2=f_2)
+                merge_x3 = feature_lstm_conv(self.lstm_type, self.filters, initial_state, f_3=f_3)
 
                 if self.pooling_type == 'ave':
                     # 第一种pooling，取平均
@@ -581,7 +651,7 @@ class ContextualReasonLayer(KE.Layer):
                     initial_state = np.maximum(merge_x1, merge_x2, merge_x3)
             else:
                 # 将四个特征共同融合
-                initial_state = feature_lstm_conv(4, self.lstm_type, initial_state, f_1=f_1, f_2=f_2, f_3=f_3)
+                initial_state = feature_lstm_conv(self.lstm_type, initial_state, f_1=f_1, f_2=f_2, f_3=f_3)
         merge_x = initial_state
         return merge_x
 
@@ -1064,18 +1134,17 @@ def fpn_classifier_graph(rois, feature_maps, image_meta,
     """
     TODO:获取其他区域
     """
-
     x = PyramidROIAlign([pool_size, pool_size],
                         name="roi_align_classifier")([rois, image_meta] + feature_maps)
-
     """
     TODO:不对称热力图 
     """
+    x = AttentionLayer(name="attention")(x)
 
     """
     TODO:特征融合
     """
-    x = ContextualReasonLayer(fc_layers_size, (pool_size, pool_size), name="contextual_reason")(x)
+    x = ContextualReasonLayer(fc_layers_size, name="contextual_reason")(x)
 
     # Two 1024 FC layers (implemented with Conv2D for consistency)
     # 将得到的特征列表送入2个1024通道数的卷积层以及2个rulu激活层
