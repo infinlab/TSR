@@ -360,7 +360,6 @@ class ProposalLayer(KE.Layer):
 """
 对proposals进行ROIAlign
 """
-
 def log2_graph(x):
     """
     以2为底的log
@@ -485,12 +484,12 @@ class PyramidROIAlign(KE.Layer):
 
 def get_attention(model, filters, initial_f, symmetry_f):
     """
-    使用对称区域构建注意力区域
-    :param model:
-    :param initial_f: [batch, num, 4, 7, 7, C]
-    :param symmetry_f: [batch, num, 4, 7, 7, C]
-    :return: [batch, num, 4, 7, 7, C]
-    """
+        使用对称区域构建注意力区域
+        :param model:
+        :param initial_f: [batch, num, 4, 7, 7, C]
+        :param symmetry_f: [batch, num, 4, 7, 7, C]
+        :return: [batch, num, 4, 7, 7, C]
+        """
     initial_f = tf.cast(initial_f, 'float32')
     symmetry_f = tf.cast(symmetry_f, 'float32')
 
@@ -500,7 +499,7 @@ def get_attention(model, filters, initial_f, symmetry_f):
         mid_f = KL.Add()([initial_f, symmetry_f])
     elif model == 'gaussian':
         pass
-    elif model == 'embedded Gaussian':
+    elif model == 'embedded_gaussian':
         pass
     elif model == 'multiply':
         mid_f = KL.Multiply()([initial_f, symmetry_f])
@@ -710,6 +709,7 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, config)
     Returns: Target ROIs and corresponding class IDs, bounding box shifts,
     and masks.
     rois: [TRAIN_ROIS_PER_IMAGE, (y1, x1, y2, x2)] in normalized coordinates
+    调整了正负样本比的rois
     class_ids: [TRAIN_ROIS_PER_IMAGE]. Integer class IDs. Zero padded.
     deltas: [TRAIN_ROIS_PER_IMAGE, (dy, dx, log(dh), log(dw))]
     masks: [TRAIN_ROIS_PER_IMAGE, height, width]. Masks cropped to bbox
@@ -777,8 +777,8 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, config)
     positive_overlaps = tf.gather(overlaps, positive_indices)
     roi_gt_box_assignment = tf.cond(
         tf.greater(tf.shape(positive_overlaps)[1], 0),
-        true_fn = lambda: tf.argmax(positive_overlaps, axis=1),
-        false_fn = lambda: tf.cast(tf.constant([]),tf.int64)
+        true_fn=lambda: tf.argmax(positive_overlaps, axis=1),
+        false_fn=lambda: tf.cast(tf.constant([]), tf.int64)
     )
     roi_gt_boxes = tf.gather(gt_boxes, roi_gt_box_assignment)
     roi_gt_class_ids = tf.gather(gt_class_ids, roi_gt_box_assignment)
@@ -835,6 +835,8 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, config)
 class DetectionTargetLayer(KE.Layer):
     """Subsamples proposals and generates target box refinement, class_ids,
     and masks for each.
+    调整正负样本
+    生成位置变化、类别、mask标签
 
     Inputs:
     proposals: [batch, N, (y1, x1, y2, x2)] in normalized coordinates. Might
@@ -1108,9 +1110,9 @@ def build_rpn_model(anchor_stride, anchors_per_location, depth):
 ############################################################
 
 
-def fpn_classifier_graph(rois, feature_maps, image_meta,
-                         pool_size, num_classes, train_bn=True,
-                         fc_layers_size=1024):
+def fpn_classifier_graph(rois, feature_maps, image_meta, pool_size, num_classes,
+                         att_model, con_lstm_type, con_merge_type, con_pooling_type,
+                         train_bn=True, fc_layers_size=1024):
     """
     fpn的检测头部，包括class和regress
 
@@ -1119,6 +1121,10 @@ def fpn_classifier_graph(rois, feature_maps, image_meta,
     :param image_meta: [batch, (meta data)]
     :param pool_size: The width of the square feature map generated from ROI Pooling.
     :param num_classes: number of classes, which determines the depth of the results
+    :param att_model:
+    :param con_lstm_type:
+    :param con_merge_type:
+    :param con_pooling_type:
     :param train_bn: Train or freeze Batch Norm layers
     :param fc_layers_size: Size of the 2 FC layers
     :return:
@@ -1134,17 +1140,25 @@ def fpn_classifier_graph(rois, feature_maps, image_meta,
     """
     TODO:获取其他区域
     """
-    x = PyramidROIAlign([pool_size, pool_size],
-                        name="roi_align_classifier")([rois, image_meta] + feature_maps)
+    x = []
+    for i in range(8):
+        f_b = PyramidROIAlign([pool_size, pool_size],
+                        name="roi_align_classifier")([rois[i], image_meta] + feature_maps)
+        x.append(f_b)
+    # x:[8 * array(batch, num_rois, w, h, c)]
+    x = np.array(x)
+    x = tf.transpose(x, [1, 2, 0, 3, 4, 5])
+    # x:[batch, num_rois, 8, w, h, c]
     """
     TODO:不对称热力图 
     """
-    x = AttentionLayer(name="attention")(x)
+    x = AttentionLayer(model=att_model, name="attention")(x)
 
     """
     TODO:特征融合
     """
-    x = ContextualReasonLayer(fc_layers_size, name="contextual_reason")(x)
+    x = ContextualReasonLayer(256, lstm_type=con_lstm_type, merge_type=con_merge_type,
+                              pooling_type=con_pooling_type, name="contextual_reason")(x)
 
     # Two 1024 FC layers (implemented with Conv2D for consistency)
     # 将得到的特征列表送入2个1024通道数的卷积层以及2个rulu激活层
@@ -1180,6 +1194,7 @@ def fpn_classifier_graph(rois, feature_maps, image_meta,
 
 
 def build_fpn_mask_graph(rois, feature_maps, image_meta,
+                         att_model, con_lstm_type, con_merge_type, con_pooling_type,
                          pool_size, num_classes, train_bn=True):
     """
 
@@ -1194,8 +1209,31 @@ def build_fpn_mask_graph(rois, feature_maps, image_meta,
     """
     # ROI Pooling
     # Shape: [batch, num_rois, MASK_POOL_SIZE, MASK_POOL_SIZE, channels]
-    x = PyramidROIAlign([pool_size, pool_size],
-                        name="roi_align_mask")([rois, image_meta] + feature_maps)
+    # x = PyramidROIAlign([pool_size, pool_size],
+    #                     name="roi_align_mask")([rois, image_meta] + feature_maps)
+
+    """
+        TODO:获取其他区域
+        """
+    x = []
+    for i in range(8):
+        f_b = PyramidROIAlign([pool_size, pool_size],
+                              name="roi_align_mask")([rois[i], image_meta] + feature_maps)
+        x.append(f_b)
+    # x:[8 * array(batch, num_rois, w, h, c)]
+    x = np.array(x)
+    x = tf.transpose(x, [1, 2, 0, 3, 4, 5])
+    # x:[batch, num_rois, 8, w, h, c]
+    """
+    TODO:不对称热力图 
+    """
+    x = AttentionLayer(model=att_model, name="attention")(x)
+
+    """
+    TODO:特征融合
+    """
+    x = ContextualReasonLayer(256, lstm_type=con_lstm_type, merge_type=con_merge_type,
+                              pooling_type=con_pooling_type, name="contextual_reason")(x)
 
     # Conv layer
     x = KL.TimeDistributed(KL.Conv2D(256, (3, 3), padding="same"),
@@ -2205,6 +2243,7 @@ class MaskRCNN():
             # Subsamples proposals and generates target outputs for training
             # Note that proposal class IDs, gt_boxes, and gt_masks are zero
             # padded. Equally, returned rois and targets are zero padded.
+            # 调整正负样本比例，并生成target
             rois, target_class_ids, target_bbox, target_mask = \
                 DetectionTargetLayer(config, name="proposal_targets")([
                     target_rois, input_gt_class_ids, gt_boxes, input_gt_masks])
@@ -2214,13 +2253,16 @@ class MaskRCNN():
             mrcnn_class_logits, mrcnn_class, mrcnn_bbox = \
                 fpn_classifier_graph(rois, mrcnn_feature_maps, input_image_meta,
                                      config.POOL_SIZE, config.NUM_CLASSES,
+                                     config.ATT_MODEL, config.LSTM_TYPE, config.MERGE_TYPE, config.POOLING_TYPE,
                                      train_bn=config.TRAIN_BN,
                                      fc_layers_size=config.FPN_CLASSIF_FC_LAYERS_SIZE)
-
+            # TODO: 上下文选取模块
             mrcnn_mask = build_fpn_mask_graph(rois, mrcnn_feature_maps,
                                               input_image_meta,
                                               config.MASK_POOL_SIZE,
                                               config.NUM_CLASSES,
+                                              config.ATT_MODEL, config.LSTM_TYPE, config.MERGE_TYPE,
+                                              config.POOLING_TYPE,
                                               train_bn=config.TRAIN_BN)
 
             # TODO: clean up (use tf.identify if necessary)
@@ -2249,11 +2291,13 @@ class MaskRCNN():
                        rpn_class_loss, rpn_bbox_loss, class_loss, bbox_loss, mask_loss]
             model = KM.Model(inputs, outputs, name='mask_rcnn')
         else:
+            # TODO: 上下文选取模块
             # Network Heads
             # Proposal classifier and BBox regressor heads
             mrcnn_class_logits, mrcnn_class, mrcnn_bbox = \
                 fpn_classifier_graph(rpn_rois, mrcnn_feature_maps, input_image_meta,
                                      config.POOL_SIZE, config.NUM_CLASSES,
+                                     config.ATT_MODEL, config.LSTM_TYPE, config.MERGE_TYPE, config.POOLING_TYPE,
                                      train_bn=config.TRAIN_BN,
                                      fc_layers_size=config.FPN_CLASSIF_FC_LAYERS_SIZE)
 
@@ -2269,6 +2313,8 @@ class MaskRCNN():
                                               input_image_meta,
                                               config.MASK_POOL_SIZE,
                                               config.NUM_CLASSES,
+                                              config.ATT_MODEL, config.LSTM_TYPE, config.MERGE_TYPE,
+                                              config.POOLING_TYPE,
                                               train_bn=config.TRAIN_BN)
 
             model = KM.Model([input_image, input_image_meta, input_anchors],
@@ -3030,6 +3076,7 @@ def unmold_image(normalized_images, config):
 ############################################################
 #  Miscellenous Graph Functions
 ############################################################
+
 
 def trim_zeros_graph(boxes, name='trim_zeros'):
     """Often boxes are represented with matrices of shape [N, 4] and
