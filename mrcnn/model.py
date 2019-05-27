@@ -505,8 +505,9 @@ def get_attention(model, filters, initial_f, symmetry_f):
         mid_f = KL.Multiply()([initial_f, symmetry_f])
     else:
         mid_f = KL.Subtract()([initial_f, symmetry_f])
-    x = KL.TimeDistributed(KL.Conv2D(filters, (3, 3), padding='same', name='attention_2a', activation='sigmoid'))(mid_f)
-    x = KL.Add()([x, initial_f])
+    x = KL.TimeDistributed(KL.Conv2D(filters, (3, 3), padding='same', name='tsr_attention_2a', activation='sigmoid'))(mid_f)
+    x = KL.TimeDistributed(KL.Conv2D(filters, (3, 3), padding='same', name='tsr_attention_2b', activation='relu'))(x)
+    x = KL.Multiply()([x, initial_f])
     return x
 
 
@@ -585,12 +586,12 @@ def feature_lstm_conv(lstm_type, filters, initial_state, **kwargs):
     # [batch*num, H, W, C]
     if lstm_type == 'unidirectional':
         lstm = KL.ConvLSTM2D(filters, (3, 3), return_sequences=False,
-                             padding='SAME', name='lstm_conv')(x)
+                             padding='SAME', name='tsr_lstm_conv')(x)
     else:
         lstm_f = KL.ConvLSTM2D(filters, (3, 3), return_sequences=False,
-                               padding='SAME', name='lstm_conv')(x)
+                               padding='SAME', name='tsr_lstm_conv')(x)
         lstm_b = KL.ConvLSTM2D(filters, (3, 3), return_sequences=False,
-                               padding='SAME', go_backwards=True, name='lstm_conv_b')(x)
+                               padding='SAME', go_backwards=True, name='tsr_lstm_conv_b')(x)
         lstm = KL.Add()([lstm_f, lstm_b])
 
     # reshape 输出
@@ -1136,14 +1137,17 @@ def fpn_classifier_graph(rois, feature_maps, image_meta, pool_size, num_classes,
     # ROI Pooling
     # Shape: [batch, num_rois, POOL_SIZE, POOL_SIZE, channels]
     # 得到经过ROIAlign之后的特征列表
+    """
+    测试
+    """
+    rois = np.tile(rois, (8, 1))
 
     """
     TODO:获取其他区域
     """
     x = []
     for i in range(8):
-        f_b = PyramidROIAlign([pool_size, pool_size],
-                        name="roi_align_classifier")([rois[i], image_meta] + feature_maps)
+        f_b = PyramidROIAlign([pool_size, pool_size], name="roi_align_classifier")([rois[i], image_meta] + feature_maps)
         x.append(f_b)
     # x:[8 * array(batch, num_rois, w, h, c)]
     x = np.array(x)
@@ -1152,13 +1156,13 @@ def fpn_classifier_graph(rois, feature_maps, image_meta, pool_size, num_classes,
     """
     TODO:不对称热力图 
     """
-    x = AttentionLayer(model=att_model, name="attention")(x)
+    x = AttentionLayer(model=att_model, name="tsr_attention")(x)
 
     """
     TODO:特征融合
     """
     x = ContextualReasonLayer(256, lstm_type=con_lstm_type, merge_type=con_merge_type,
-                              pooling_type=con_pooling_type, name="contextual_reason")(x)
+                              pooling_type=con_pooling_type, name="tsr_contextual_reason")(x)
 
     # Two 1024 FC layers (implemented with Conv2D for consistency)
     # 将得到的特征列表送入2个1024通道数的卷积层以及2个rulu激活层
@@ -1227,13 +1231,13 @@ def build_fpn_mask_graph(rois, feature_maps, image_meta,
     """
     TODO:不对称热力图 
     """
-    x = AttentionLayer(model=att_model, name="attention")(x)
+    x = AttentionLayer(model=att_model, name="tsr_attention")(x)
 
     """
     TODO:特征融合
     """
     x = ContextualReasonLayer(256, lstm_type=con_lstm_type, merge_type=con_merge_type,
-                              pooling_type=con_pooling_type, name="contextual_reason")(x)
+                              pooling_type=con_pooling_type, name="tsr_contextual_reason")(x)
 
     # Conv layer
     x = KL.TimeDistributed(KL.Conv2D(256, (3, 3), padding="same"),
@@ -2578,7 +2582,7 @@ class MaskRCNN():
         # Pre-defined layer regular expressions
         layer_regex = {
             # all layers but the backbone
-            "heads": r"(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)",
+            "heads": r"(tsr\_.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)",
             # From a specific Resnet stage and up
             "3+": r"(res3.*)|(bn3.*)|(res4.*)|(bn4.*)|(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)",
             "4+": r"(res4.*)|(bn4.*)|(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)",
