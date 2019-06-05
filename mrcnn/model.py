@@ -447,48 +447,43 @@ class PyramidROIAlign(KE.Layer):
         return pooled
 
     def compute_output_shape(self, input_shape):
-        print(input_shape)
-        print(input_shape[0][:2] + self.pool_shape + (input_shape[2][-1], ))
         return input_shape[0][:2] + self.pool_shape + (input_shape[2][-1], )
 
 
 ############################################################
 #  Attention Layer
 ############################################################
-
-def get_attention(model, filters, initial_f, symmetry_f):
-    """
-        使用对称区域构建注意力区域
-        :param model:
-        :param initial_f: [batch, num, 4, 7, 7, C]
-        :param symmetry_f: [batch, num, 4, 7, 7, C]
-        :return: [batch, num, 4, 7, 7, C]
-        """
-    #     initial_f = tf.cast(initial_f, 'float32')
-    #     symmetry_f = tf.cast(symmetry_f, 'float32')
-    in_shape = initial_f.get_shape().as_list()
-    re_shape = in_shape[:2] + in_shape[3:]
-    re_shape = [1] + [-1] + [7, 7, 256]
-    initial_f = tf.reshape(initial_f, re_shape)
-    symmetry_f = tf.reshape(symmetry_f, re_shape)
-
+def get_attention(inputs, model):
+    # 构造左右镜像图片
+    f = inputs
+    symmetry_f = tf.image.flip_up_down(f)
     if model == 'concat':
-        mid_f = KL.Concatenate(axis=-1)([initial_f, symmetry_f])
+        mid_f = KL.Concatenate(axis=-1)([f, symmetry_f])
     elif model == 'add':
-        mid_f = KL.Add()([initial_f, symmetry_f])
+        mid_f = KL.Add()([f, symmetry_f])
     elif model == 'gaussian':
         pass
     elif model == 'embedded_gaussian':
         pass
     elif model == 'multiply':
-        mid_f = KL.Multiply()([initial_f, symmetry_f])
+        mid_f = KL.Multiply()([f, symmetry_f])
     else:
-        mid_f = KL.Subtract()([initial_f, symmetry_f])
-    x = KL.TimeDistributed(KL.Conv2D(filters, (3, 3), padding='same', name='tsr_attention_2a', activation='sigmoid'))(
-        mid_f)
-    x = KL.TimeDistributed(KL.Conv2D(filters, (3, 3), padding='same', name='tsr_attention_2b', activation='relu'))(x)
-    x = KL.Multiply()([x, initial_f])
+        mid_f = KL.Subtract()([f, symmetry_f])
+    x = KL.Conv2D(256, (3, 3), padding='same', name='tsr_attention_2a')(mid_f)
+    x = BatchNorm(name='tsr_attention_bn1')(x, training=True)
+    x = KL.Activation('sigmoid')(x)
+    x = KL.Conv2D(256, (3, 3), padding='same', name='tsr_attention_2b')(x)
+    x = BatchNorm(name='tsr_attention_bn1')(x, training=True)
+    x = KL.Activation('relu')(x)
+    x = KL.Multiply()([f, x])
     return x
+
+
+def global_attention(depth, model='subtract'):
+    input_feature_map = KL.Input(shape=[None, None, depth],
+                                 name="input_tsr_feature_map")
+    outputs = get_attention(input_feature_map, model)
+    return KM.Model([input_feature_map], [outputs], name="tsr_attention_model")
 
 
 class AttentionLayer(KE.Layer):
@@ -504,122 +499,162 @@ class AttentionLayer(KE.Layer):
         :param inputs:[batch, num, 8, 7, 7, C]
         :return:[batch, num, 4, 7, 7, C]
         """
-        original_feature = inputs
-
         # 拆分8个box的特征[batch, num, W, H, C]
-
-        f = [inputs[0], inputs[1], inputs[2], inputs[3]]
-        _f = [inputs[0], inputs[1], inputs[2], inputs[3]]
-
         alist = []
-        for i in range(4):
-            attention = get_attention(self.model, self.filters, f[i], _f[i])
-            alist.append(attention)
-        return tf.cast(alist,tf.float32)
+        for f in inputs:
+            # 构造左右镜像图片
+            symmetry_f = tf.image.flip_up_down(f)
+            if self.model == 'concat':
+                mid_f = KL.Concatenate(axis=-1)([f, symmetry_f])
+            elif self.model == 'add':
+                mid_f = KL.Add()([f, symmetry_f])
+            elif self.model == 'gaussian':
+                pass
+            elif self.model == 'embedded_gaussian':
+                pass
+            elif self.model == 'multiply':
+                mid_f = KL.Multiply()([f, symmetry_f])
+            else:
+                mid_f = KL.Subtract()([f, symmetry_f])
+            x = KL.Conv2D(self.filters, (3, 3), padding='same', name='rpn_attention_2a')(mid_f)
+            x = BatchNorm(name='rpn_attention_bn1')(x, training=True)
+            x = KL.Activation('sigmoid')(x)
+            x = KL.Conv2D(self.filters, (3, 3), padding='same', name='rpn_attention_2b')(x)
+            x = BatchNorm(name='rpn_attention_bn1')(x, training=True)
+            x = KL.Activation('relu')(x)
+            x = KL.Multiply()([f, x])
+            alist.append(x)
+        return alist
 
     def compute_output_shape(self, input_shape):
         print(input_shape)
-        print(tuple([4]) + input_shape[0][:4] + tuple([self.filters]))
-        return tuple([4]) + input_shape[0][:4] + tuple([self.filters])
+        return input_shape
 
 
 ############################################################
 #  Contextual reasoning Layer
 ############################################################
 
-def feature_lstm_conv(lstm_type, filters, initial_state, **kwargs):
-    """
-
-    :return:
-    """
-    # 组合上下文
-    # 调整数据格式为[batch*num , times, H, W, C]
-    # 输入数据维度 times * [batch, num, H, W, C]
-    in_shape = initial_state.get_shape().as_list()
-
-    # [batch*num, H, W, C]
-    re_shape = [-1] + in_shape[2:]
-    initial_state = tf.reshape(initial_state, re_shape)
-
-    # [times, batch * num, H, W, C]
-    for key, value in kwargs.items():
-        key = tf.reshape(value, re_shape)
-        initial_state = tf.stack([initial_state, key])
-
-    # # [batch * num, times, H, W, C]
-    #  可以输入LSTM的数据
-    x = tf.transpose(initial_state, perm=[1, 0, 2, 3, 4])
-
-    # 采用双向GRU还是单向ConvLSTM2D
-    # 生成数据维度
-    # [batch*num, H, W, C]
-    if lstm_type == 'unidirectional':
-        lstm = KL.ConvLSTM2D(filters, (3, 3), return_sequences=False,
-                             padding='SAME', name='tsr_lstm_conv')(x)
-    else:
-        lstm_f = KL.ConvLSTM2D(filters, (3, 3), return_sequences=False,
-                               padding='SAME', name='tsr_lstm_conv')(x)
-        lstm_b = KL.ConvLSTM2D(filters, (3, 3), return_sequences=False,
-                               padding='SAME', go_backwards=True, name='tsr_lstm_conv_b')(x)
-        lstm = KL.Add()([lstm_f, lstm_b])
-
-    # reshape 输出
-    # [batch, num, H, W, C]
-    ls_shape = in_shape[:1]+[-1]+in_shape[2:]
-    lstm = tf.reshape(lstm, ls_shape)
-
-    return lstm
-
-
-class ContextualReasonLayer(KE.Layer):
-    """
-    使用RNN机制对CNN特征进行融合
-    inputs：
-    -[batch, obj_num, 4, (pool_weight, pool_height, channel)]
-
-    outputs:
-    -[batch, obj_num,(pool_weight, pool_height, channel)]
-    """
-    def __init__(self, filters, merge_times=2, lstm_type='unidirectional', merge_type='parallel',
-                 pooling_type='ave', **kwargs):
-        super(ContextualReasonLayer, self).__init__(**kwargs)
-        self.merge_times = merge_times
-        self.pooling_type = pooling_type
-        self.merge_type = merge_type
-        self.lstm_type = lstm_type
-        self.filters = filters
-
-    def call(self, inputs):
-        """
-        n次融合感兴趣区域与上下文信息
-        :param inputs: [batch, num, 4, 7, 7, C]
-        :return:[batch, num, 7, 7, C]
-        """
-        initial_state = inputs[0]
-        for i in range(self.merge_times):
-            if self.merge_type == 'parallel':
-                # 分别融合3个box与Initial_state，并进行pooling
-                merge_x1 = feature_lstm_conv(self.lstm_type, self.filters, initial_state, f_1=inputs[1])
-                merge_x2 = feature_lstm_conv(self.lstm_type, self.filters, initial_state, f_2=inputs[2])
-                merge_x3 = feature_lstm_conv(self.lstm_type, self.filters, initial_state, f_3=inputs[3])
-
-                if self.pooling_type == 'ave':
-                    # 第一种pooling，取平均
-                    initial_state = (merge_x1 + merge_x2 + merge_x3) / 3
-                else:
-                    # 第二种pooling，取最值
-                    initial_state = np.maximum(merge_x1, merge_x2, merge_x3)
-            else:
-                # 将四个特征共同融合
-                initial_state = feature_lstm_conv(self.lstm_type, initial_state, f_1=inputs[1], f_2=inputs[2], f_3=inputs[3])
-        merge_x = initial_state
-        return merge_x
-
-    def compute_output_shape(self, input_shape):
-#         print(tuple(input_shape[0][0])+tuple[-1]+input_shape[2:])
-        print(input_shape)
-        print(input_shape[1:])
-        return input_shape[1:]
+# def feature_lstm_conv(lstm_type, filters, *args):
+#     """
+#
+#     :return:
+#     """
+#     # 组合上下文
+#     # 调整数据格式为[batch*num , times, H, W, C]
+#     # 输入数据维度 times * [batch, num, H, W, C]
+#     in_shape = args[0].get_shape().as_list()
+#     print(in_shape)
+#     # [batch*num, H, W, C]
+#     re_shape = [-1] + in_shape[2:]
+#
+#     initial_state = []
+#     # [times, batch * num, H, W, C]
+#     for f in args:
+#         f = KL.Lambda(lambda t: tf.reshape(t, re_shape))(f)
+#         initial_state.append(f)
+#     initial_state = KL.Lambda(lambda t: tf.stack([*t]))(initial_state)
+#
+#     # # [batch * num, times, H, W, C]
+#     #  可以输入LSTM的数据
+#     x = KL.Lambda(lambda t: tf.transpose(t, perm=[1, 0, 2, 3, 4]))(initial_state)
+#
+#     # 采用双向GRU还是单向ConvLSTM2D
+#     # 生成数据维度
+#     # [batch*num, H, W, C]
+#     if lstm_type == 'unidirectional':
+#         lstm = KL.ConvLSTM2D(filters, (3, 3), return_sequences=False,
+#                              padding='SAME', name='tsr_lstm_conv')(x)
+#     else:
+#         lstm_f = KL.ConvLSTM2D(filters, (3, 3), return_sequences=False,
+#                                padding='SAME', name='tsr_lstm_conv')(x)
+#         lstm_b = KL.ConvLSTM2D(filters, (3, 3), return_sequences=False,
+#                                padding='SAME', go_backwards=True, name='tsr_lstm_conv_b')(x)
+#         lstm = KL.Add()([lstm_f, lstm_b])
+#
+#     # reshape 输出
+#     # [batch, num, H, W, C]
+#     lstm = KL.Lambda(lambda t: tf.reshape(t, in_shape))(lstm)
+#     return lstm
+#
+#
+# def contextual(inputs, filters, merge_times=2, lstm_type='unidirectional', merge_type='parallel', pooling_type='ave'):
+#     initial_state = inputs[0]
+#     print(initial_state)
+#     for i in range(merge_times):
+#         if merge_type == 'parallel':
+#             # 分别融合3个box与Initial_state，并进行pooling
+#             merge_x1 = KL.Lambda(lambda x: feature_lstm_conv(lstm_type, filters, *x),
+#                                  name='merge_p1_' + str(i))([initial_state, inputs[1]])
+#             merge_x2 = KL.Lambda(lambda x: feature_lstm_conv(lstm_type, filters, *x),
+#                                  name='merge_p2_' + str(i))([initial_state, inputs[2]])
+#             merge_x3 = KL.Lambda(lambda x: feature_lstm_conv(lstm_type, filters, *x),
+#                                  name='merge_p3_' + str(i))([initial_state, inputs[3]])
+#
+#             if pooling_type == 'ave':
+#                 # 第一种pooling，取平均
+#                 initial_state = KL.Average()([merge_x1, merge_x2, merge_x3])
+#             else:
+#                 # 第二种pooling，取最值
+#                 initial_state = KL.Multiply()([merge_x1, merge_x2, merge_x3])
+#         else:
+#             # 将四个特征共同融合
+#             initial_state = KL.Lambda(lambda x: feature_lstm_conv(lstm_type, filters, *x),
+#                                       name='merge_up_' + str(i))([initial_state, inputs[1], inputs[2], inputs[3]])
+#     merge_x = initial_state
+#     return merge_x
+#
+#
+# class ContextualReasonLayer(KE.Layer):
+#     """
+#     使用RNN机制对CNN特征进行融合
+#     inputs：
+#     -[batch, obj_num, 4, (pool_weight, pool_height, channel)]
+#
+#     outputs:
+#     -[batch, obj_num,(pool_weight, pool_height, channel)]
+#     """
+#     def __init__(self, filters, merge_times=2, lstm_type='unidirectional', merge_type='parallel',
+#                  pooling_type='ave', **kwargs):
+#         super(ContextualReasonLayer, self).__init__(**kwargs)
+#         self.merge_times = merge_times
+#         self.pooling_type = pooling_type
+#         self.merge_type = merge_type
+#         self.lstm_type = lstm_type
+#         self.filters = filters
+#
+#     def call(self, inputs):
+#         """
+#         n次融合感兴趣区域与上下文信息
+#         :param inputs: [batch, num, 4, 7, 7, C]
+#         :return:[batch, num, 7, 7, C]
+#         """
+#         inputs = tf.cast(inputs, tf.float32)
+#         initial_state = inputs[0]
+#         for i in range(self.merge_times):
+#             if self.merge_type == 'parallel':
+#                 # 分别融合3个box与Initial_state，并进行pooling
+#                 merge_x1 = feature_lstm_conv(self.lstm_type, self.filters, initial_state, f_1=inputs[1])
+#                 merge_x2 = feature_lstm_conv(self.lstm_type, self.filters, initial_state, f_2=inputs[2])
+#                 merge_x3 = feature_lstm_conv(self.lstm_type, self.filters, initial_state, f_3=inputs[3])
+#
+#                 if self.pooling_type == 'ave':
+#                     # 第一种pooling，取平均
+#                     initial_state = (merge_x1 + merge_x2 + merge_x3) / 3
+#                 else:
+#                     # 第二种pooling，取最值
+#                     initial_state = np.maximum(merge_x1, merge_x2, merge_x3)
+#             else:
+#                 # 将四个特征共同融合
+#                 initial_state = feature_lstm_conv(self.lstm_type,
+#                                                    initial_state, f_1=inputs[1], f_2=inputs[2], f_3=inputs[3])
+#         merge_x = initial_state
+#         return merge_x
+#
+#     def compute_output_shape(self, input_shape):
+#         print(input_shape)
+#         print(input_shape[0])
+#         return input_shape[0]
 
 
 ############################################################
@@ -1070,7 +1105,7 @@ def build_rpn_model(anchor_stride, anchors_per_location, depth):
 ############################################################
 
 def fpn_classifier_graph(rois, feature_maps, image_meta, pool_size, num_classes,
-                         att_model, con_lstm_type, con_merge_type, con_pooling_type,
+                         batch, num_rois, con_merge_type, con_pooling_type,
                          train_bn=True, fc_layers_size=1024):
     """Builds the computation graph of the feature pyramid network classifier
     and regressor heads.
@@ -1093,39 +1128,55 @@ def fpn_classifier_graph(rois, feature_maps, image_meta, pool_size, num_classes,
     """
     # ROI Pooling
     # Shape: [batch, num_rois, POOL_SIZE, POOL_SIZE, channels]
+    # x = PyramidROIAlign([pool_size, pool_size],
+    #                     name="roi_align_classifier")([rois, image_meta] + feature_maps)
 
     """
     测试
     """
-    rois = [rois, rois, rois, rois, rois, rois, rois, rois]
+    rois = [rois, rois, rois, rois]
     """
     TODO:获取其他区域
     """
+    print("fpn*********----------->>>>>>>>>>>>>")
     x = []
-    for i in range(8):
+    for i in range(4):
         f = PyramidROIAlign([pool_size, pool_size],
                             name="roi_align_classifier_"+str(i))([rois[i], image_meta] + feature_maps)
+        f = KL.Lambda(lambda t: tf.reshape(t, [-1]+f.get_shape().as_list()[2:]))(f)
+        print('f:', f)
         x.append(f)
-    # x:[8 * array(batch, num_rois, w, h, c)]
-    # x = tf.transpose(x, [1, 2, 0, 3, 4, 5])
-    # print('x:', x)
-    # x:[8, batch, num_rois, w, h, c]
-    """
-    TODO:不对称热力图
-    """
-    x = AttentionLayer(model=att_model, name="tsr_attention_class")(x)
 
-    """
-    TODO:特征融合
-    """
-    x = ContextualReasonLayer(256, lstm_type=con_lstm_type, merge_type=con_merge_type,
-                              pooling_type=con_pooling_type, name="tsr_contextual_reason_class")(x)
+    initial_state = x[0]
+    for i in range(2):
+        if con_merge_type == 'parallel':
+            merge_1 = KL.Lambda(lambda t: tf.stack([*t], axis=1))([initial_state, x[1]])
+            merge_2 = KL.Lambda(lambda t: tf.stack([*t], axis=1))([initial_state, x[2]])
+            merge_3 = KL.Lambda(lambda t: tf.stack([*t], axis=1))([initial_state, x[3]])
+            merge_1 = KL.ConvLSTM2D(256, (3, 3),
+                                    return_sequences=False, padding='SAME', name='tsr_class_p1_' + str(i))(merge_1)
+            print('one!')
+            merge_2 = KL.ConvLSTM2D(256, (3, 3),
+                                    return_sequences=False, padding='SAME', name='tsr_class_p2_' + str(i))(merge_2)
+            merge_3 = KL.ConvLSTM2D(256, (3, 3),
+                                    return_sequences=False, padding='SAME', name='tsr_class_p3_' + str(i))(merge_3)
+            if con_pooling_type == 'ave':
+                # 第一种pooling，取平均
+                initial_state = KL.Average()([merge_1, merge_2, merge_3])
+            else:
+                # 第二种pooling，取最值
+                initial_state = KL.Multiply()([merge_1, merge_2, merge_3])
+        else:
+            merge = KL.Lambda(lambda t: tf.stack([*t], axis=1))([initial_state, x[1], x[2], x[3]])
+            initial_state = KL.ConvLSTM2D(256, (3, 3),
+                                          return_sequences=False, padding='SAME', name='tsr-class_up_' + str(i))(merge)
+    ls_shape = [batch]+[num_rois]+x[0].get_shape().as_list()[1:]
+    lstm = KL.Lambda(lambda t: tf.reshape(t, ls_shape))(initial_state)
+    print('lstm:', lstm)
 
-    # x = PyramidROIAlign([pool_size, pool_size],
-    #                 name="roi_align_classifier")([rois, image_meta] + feature_maps)
     # Two 1024 FC layers (implemented with Conv2D for consistency)
     x = KL.TimeDistributed(KL.Conv2D(fc_layers_size, (pool_size, pool_size), padding="valid"),
-                           name="mrcnn_class_conv1")(x)
+                           name="mrcnn_class_conv1")(lstm)
     x = KL.TimeDistributed(BatchNorm(), name='mrcnn_class_bn1')(x, training=train_bn)
     x = KL.Activation('relu')(x)
     x = KL.TimeDistributed(KL.Conv2D(fc_layers_size, (1, 1)),
@@ -1147,15 +1198,13 @@ def fpn_classifier_graph(rois, feature_maps, image_meta, pool_size, num_classes,
     x = KL.TimeDistributed(KL.Dense(num_classes * 4, activation='linear'),
                            name='mrcnn_bbox_fc')(shared)
     # Reshape to [batch, num_rois, NUM_CLASSES, (dy, dx, log(dh), log(dw))]
-    print(x)
     s = K.int_shape(x)
-    print(s)
     mrcnn_bbox = KL.Reshape((s[1], num_classes, 4), name="mrcnn_bbox")(x)
     return mrcnn_class_logits, mrcnn_probs, mrcnn_bbox
 
 
 def build_fpn_mask_graph(rois, feature_maps, image_meta, pool_size, num_classes,
-                         att_model, con_lstm_type, con_merge_type, con_pooling_type, train_bn=True):
+                         batch, num_rois, con_merge_type, con_pooling_type, train_bn=True):
     """Builds the computation graph of the mask head of Feature Pyramid Network.
 
     rois: [batch, num_rois, (y1, x1, y2, x2)] Proposal boxes in normalized
@@ -1174,29 +1223,51 @@ def build_fpn_mask_graph(rois, feature_maps, image_meta, pool_size, num_classes,
     """
     测试
     """
-    rois = [rois, rois, rois, rois, rois, rois, rois, rois]
+    rois = [rois, rois, rois, rois]
     """
     TODO:获取其他区域
     """
-    x = []
-    for i in range(8):
-        f = PyramidROIAlign([pool_size, pool_size],
-                            name="roi_align_mask"+str(i))([rois[i], image_meta] + feature_maps)
-        x.append(f)
-    # x:[8, batch, num_rois, w, h, c]
-    """
-    TODO:不对称热力图 
-    """
-    x = AttentionLayer(model=att_model, name="tsr_attention_mask")(x)
 
     """
     TODO:特征融合
     """
-    x = ContextualReasonLayer(256, lstm_type=con_lstm_type, merge_type=con_merge_type,
-                              pooling_type=con_pooling_type, name="tsr_contextual_reason_mask")(x)
+    print("mask*********----------->>>>>>>>>>>>>")
+    x = []
+    for i in range(4):
+        f = PyramidROIAlign([pool_size, pool_size],
+                            name="roi_align_mask_" + str(i))([rois[i], image_meta] + feature_maps)
+        f = KL.Lambda(lambda t: tf.reshape(t, [-1] + f.get_shape().as_list()[2:]))(f)
+        print('f:', f)
+        x.append(f)
+
+    initial_state = x[0]
+    for i in range(2):
+        if con_merge_type == 'parallel':
+            merge_1 = KL.Lambda(lambda t: tf.stack([*t], axis=1))([initial_state, x[1]])
+            merge_2 = KL.Lambda(lambda t: tf.stack([*t], axis=1))([initial_state, x[2]])
+            merge_3 = KL.Lambda(lambda t: tf.stack([*t], axis=1))([initial_state, x[3]])
+            merge_1 = KL.ConvLSTM2D(256, (3, 3),
+                                    return_sequences=False, padding='SAME', name='tsr_mask_p1_' + str(i))(merge_1)
+            merge_2 = KL.ConvLSTM2D(256, (3, 3),
+                                    return_sequences=False, padding='SAME', name='tsr_mask_p2_' + str(i))(merge_2)
+            merge_3 = KL.ConvLSTM2D(256, (3, 3),
+                                    return_sequences=False, padding='SAME', name='tsr_mask_p3_' + str(i))(merge_3)
+            if con_pooling_type == 'ave':
+                # 第一种pooling，取平均
+                initial_state = KL.Average()([merge_1, merge_2, merge_3])
+            else:
+                # 第二种pooling，取最值
+                initial_state = KL.Multiply()([merge_1, merge_2, merge_3])
+        else:
+            merge = KL.Lambda(lambda t: tf.stack([*t], axis=1))([initial_state, x[1], x[2], x[3]])
+            initial_state = KL.ConvLSTM2D(256, (3, 3),
+                                          return_sequences=False, padding='SAME', name='tsr-mask_up_' + str(i))(merge)
+    ls_shape = [batch] + [num_rois] + x[0].get_shape().as_list()[1:]
+    lstm = KL.Lambda(lambda t: tf.reshape(t, ls_shape))(initial_state)
+    print('lstm:', lstm)
     # Conv layers
     x = KL.TimeDistributed(KL.Conv2D(256, (3, 3), padding="same"),
-                           name="mrcnn_mask_conv1")(x)
+                           name="mrcnn_mask_conv")(lstm)
     x = KL.TimeDistributed(BatchNorm(),
                            name='mrcnn_mask_bn1')(x, training=train_bn)
     x = KL.Activation('relu')(x)
@@ -2142,8 +2213,24 @@ class MaskRCNN():
         P6 = KL.MaxPooling2D(pool_size=(1, 1), strides=2, name="fpn_p6")(P5)
 
         # Note that P6 is used in RPN, but not in the classifier heads.
-        rpn_feature_maps = [P2, P3, P4, P5, P6]
-        mrcnn_feature_maps = [P2, P3, P4, P5]
+        rpn_feature_maps_1 = [P2, P3, P4, P5, P6]
+
+        # Attention:全局的注意力
+        rpn_feature_maps = []
+        xo = 0
+        for f in rpn_feature_maps_1:
+            xo += 1
+            symmetry_f = KL.Lambda(
+                lambda t: tf.image.flip_up_down(t)
+            )(f)
+            mid_f = KL.Subtract()([f, symmetry_f])
+            x = KL.Conv2D(256, (3, 3), padding='same', name='tsr_attention_a' + str(xo), activation='relu')(mid_f)
+            x = KL.Conv2D(256, (3, 3), padding='same', name='tsr_attention_b' + str(xo), activation='sigmoid')(x)
+            x = KL.Multiply()([f, x])
+            rpn_feature_maps.append(x)
+
+        mrcnn_feature_maps = rpn_feature_maps[:4]
+
 
         # Anchors
         if mode == "training":
@@ -2215,14 +2302,16 @@ class MaskRCNN():
             mrcnn_class_logits, mrcnn_class, mrcnn_bbox = \
                 fpn_classifier_graph(rois, mrcnn_feature_maps, input_image_meta,
                                      config.POOL_SIZE, config.NUM_CLASSES,
-                                     config.ATT_MODEL, config.LSTM_TYPE, config.MERGE_TYPE, config.POOLING_TYPE,
+                                     config.BATCH_SIZE, config.TRAIN_ROIS_PER_IMAGE,
+                                     config.MERGE_TYPE, config.POOLING_TYPE,
                                      train_bn=config.TRAIN_BN,
                                      fc_layers_size=config.FPN_CLASSIF_FC_LAYERS_SIZE)
 
             mrcnn_mask = \
                 build_fpn_mask_graph(rois, mrcnn_feature_maps, input_image_meta,
                                      config.MASK_POOL_SIZE, config.NUM_CLASSES,
-                                     config.ATT_MODEL, config.LSTM_TYPE, config.MERGE_TYPE, config.POOLING_TYPE,
+                                     config.BATCH_SIZE, config.TRAIN_ROIS_PER_IMAGE,
+                                     config.MERGE_TYPE, config.POOLING_TYPE,
                                      train_bn=config.TRAIN_BN)
 
             # TODO: clean up (use tf.identify if necessary)
@@ -2256,7 +2345,8 @@ class MaskRCNN():
             mrcnn_class_logits, mrcnn_class, mrcnn_bbox = \
                 fpn_classifier_graph(rpn_rois, mrcnn_feature_maps, input_image_meta,
                                      config.POOL_SIZE, config.NUM_CLASSES,
-                                     config.ATT_MODEL, config.LSTM_TYPE, config.MERGE_TYPE, config.POOLING_TYPE,
+                                     config.BATCH_SIZE, config.POST_NMS_ROIS_INFERENCE,
+                                     config.MERGE_TYPE, config.POOLING_TYPE,
                                      train_bn=config.TRAIN_BN,
                                      fc_layers_size=config.FPN_CLASSIF_FC_LAYERS_SIZE)
 
@@ -2268,12 +2358,10 @@ class MaskRCNN():
 
             # Create masks for detections
             detection_boxes = KL.Lambda(lambda x: x[..., :4])(detections)
-            mrcnn_mask = build_fpn_mask_graph(detection_boxes, mrcnn_feature_maps,
-                                              input_image_meta,
-                                              config.MASK_POOL_SIZE,
-                                              config.NUM_CLASSES,
-                                              config.ATT_MODEL, config.LSTM_TYPE, config.MERGE_TYPE,
-                                              config.POOLING_TYPE,
+            mrcnn_mask = build_fpn_mask_graph(detection_boxes, mrcnn_feature_maps, input_image_meta,
+                                              config.MASK_POOL_SIZE, config.NUM_CLASSES,
+                                              config.BATCH_SIZE, config.POST_NMS_ROIS_INFERENCE,
+                                              config.MERGE_TYPE, config.POOLING_TYPE,
                                               train_bn=config.TRAIN_BN)
 
             model = KM.Model([input_image, input_image_meta, input_anchors],
@@ -2537,7 +2625,7 @@ class MaskRCNN():
         # Pre-defined layer regular expressions
         layer_regex = {
             # all layers but the backbone
-            "heads": r"(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)",
+            "heads": r"(tsr\_.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)",
             # From a specific Resnet stage and up
             "3+": r"(res3.*)|(bn3.*)|(res4.*)|(bn4.*)|(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)",
             "4+": r"(res4.*)|(bn4.*)|(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)",
@@ -3091,3 +3179,5 @@ def denorm_boxes_graph(boxes, shape):
     scale = tf.concat([h, w, h, w], axis=-1) - tf.constant(1.0)
     shift = tf.constant([0., 0., 1., 1.])
     return tf.cast(tf.round(tf.multiply(boxes, scale) + shift), tf.int32)
+
+
