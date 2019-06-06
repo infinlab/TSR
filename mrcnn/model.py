@@ -1130,50 +1130,50 @@ def fpn_classifier_graph(rois, feature_maps, image_meta, pool_size, num_classes,
     # Shape: [batch, num_rois, POOL_SIZE, POOL_SIZE, channels]
     # x = PyramidROIAlign([pool_size, pool_size],
     #                     name="roi_align_classifier")([rois, image_meta] + feature_maps)
-
+    print("fpn*********----------->>>>>>>>>>>>>")
     """
     测试
     """
-    rois = [rois, rois, rois, rois]
-    """
-    TODO:获取其他区域
-    """
-    print("fpn*********----------->>>>>>>>>>>>>")
-    x = []
-    for i in range(4):
-        f = PyramidROIAlign([pool_size, pool_size],
-                            name="roi_align_classifier_"+str(i))([rois[i], image_meta] + feature_maps)
-        f = KL.Lambda(lambda t: tf.reshape(t, [-1]+f.get_shape().as_list()[2:]))(f)
-        print('f:', f)
-        x.append(f)
+    test = 1
+    if test == 1:
+        rois = [rois, rois, rois, rois]
+        x = []
+        for i in range(4):
+            f = PyramidROIAlign([pool_size, pool_size],
+                                name="roi_align_classifier_"+str(i))([rois[i], image_meta] + feature_maps)
+            f = KL.Lambda(lambda t: tf.reshape(t, [-1]+f.get_shape().as_list()[2:]))(f)
+            print('f:', f)
+            x.append(f)
 
-    initial_state = x[0]
-    for i in range(2):
-        if con_merge_type == 'parallel':
-            merge_1 = KL.Lambda(lambda t: tf.stack([*t], axis=1))([initial_state, x[1]])
-            merge_2 = KL.Lambda(lambda t: tf.stack([*t], axis=1))([initial_state, x[2]])
-            merge_3 = KL.Lambda(lambda t: tf.stack([*t], axis=1))([initial_state, x[3]])
-            merge_1 = KL.ConvLSTM2D(256, (3, 3),
-                                    return_sequences=False, padding='SAME', name='tsr_class_p1_' + str(i))(merge_1)
-            print('one!')
-            merge_2 = KL.ConvLSTM2D(256, (3, 3),
-                                    return_sequences=False, padding='SAME', name='tsr_class_p2_' + str(i))(merge_2)
-            merge_3 = KL.ConvLSTM2D(256, (3, 3),
-                                    return_sequences=False, padding='SAME', name='tsr_class_p3_' + str(i))(merge_3)
-            if con_pooling_type == 'ave':
-                # 第一种pooling，取平均
-                initial_state = KL.Average()([merge_1, merge_2, merge_3])
+        initial_state = x[0]
+        for i in range(2):
+            if con_merge_type == 'parallel':
+                merge_1 = KL.Lambda(lambda t: tf.stack([*t], axis=1))([initial_state, x[1]])
+                merge_2 = KL.Lambda(lambda t: tf.stack([*t], axis=1))([initial_state, x[2]])
+                merge_3 = KL.Lambda(lambda t: tf.stack([*t], axis=1))([initial_state, x[3]])
+                merge_1 = KL.ConvLSTM2D(256, (3, 3),
+                                        return_sequences=False, padding='SAME', name='tsr_class_p1_' + str(i))(merge_1)
+                print('one!')
+                merge_2 = KL.ConvLSTM2D(256, (3, 3),
+                                        return_sequences=False, padding='SAME', name='tsr_class_p2_' + str(i))(merge_2)
+                merge_3 = KL.ConvLSTM2D(256, (3, 3),
+                                        return_sequences=False, padding='SAME', name='tsr_class_p3_' + str(i))(merge_3)
+                if con_pooling_type == 'ave':
+                    # 第一种pooling，取平均
+                    initial_state = KL.Average()([merge_1, merge_2, merge_3])
+                else:
+                    # 第二种pooling，取最值
+                    initial_state = KL.Multiply()([merge_1, merge_2, merge_3])
             else:
-                # 第二种pooling，取最值
-                initial_state = KL.Multiply()([merge_1, merge_2, merge_3])
-        else:
-            merge = KL.Lambda(lambda t: tf.stack([*t], axis=1))([initial_state, x[1], x[2], x[3]])
-            initial_state = KL.ConvLSTM2D(256, (3, 3),
-                                          return_sequences=False, padding='SAME', name='tsr-class_up_' + str(i))(merge)
-    ls_shape = [batch]+[num_rois]+x[0].get_shape().as_list()[1:]
-    lstm = KL.Lambda(lambda t: tf.reshape(t, ls_shape))(initial_state)
-    print('lstm:', lstm)
-
+                merge = KL.Lambda(lambda t: tf.stack([*t], axis=1))([initial_state, x[1], x[2], x[3]])
+                initial_state = KL.ConvLSTM2D(256, (3, 3),
+                                              return_sequences=False, padding='SAME', name='tsr-class_up_' + str(i))(merge)
+        ls_shape = [batch]+[num_rois]+x[0].get_shape().as_list()[1:]
+        lstm = KL.Lambda(lambda t: tf.reshape(t, ls_shape))(initial_state)
+        print('lstm:', lstm)
+    else:
+        lstm = PyramidROIAlign([pool_size, pool_size],
+                            name="roi_align_classifier_")([rois, image_meta] + feature_maps)
     # Two 1024 FC layers (implemented with Conv2D for consistency)
     x = KL.TimeDistributed(KL.Conv2D(fc_layers_size, (pool_size, pool_size), padding="valid"),
                            name="mrcnn_class_conv1")(lstm)
@@ -1223,48 +1223,46 @@ def build_fpn_mask_graph(rois, feature_maps, image_meta, pool_size, num_classes,
     """
     测试
     """
-    rois = [rois, rois, rois, rois]
-    """
-    TODO:获取其他区域
-    """
-
-    """
-    TODO:特征融合
-    """
     print("mask*********----------->>>>>>>>>>>>>")
-    x = []
-    for i in range(4):
-        f = PyramidROIAlign([pool_size, pool_size],
-                            name="roi_align_mask_" + str(i))([rois[i], image_meta] + feature_maps)
-        f = KL.Lambda(lambda t: tf.reshape(t, [-1] + f.get_shape().as_list()[2:]))(f)
-        print('f:', f)
-        x.append(f)
+    test = 1
+    if test == 1:
+        rois = [rois, rois, rois, rois]
+        x = []
+        for i in range(4):
+            f = PyramidROIAlign([pool_size, pool_size],
+                                name="roi_align_mask_" + str(i))([rois[i], image_meta] + feature_maps)
+            f = KL.Lambda(lambda t: tf.reshape(t, [-1] + f.get_shape().as_list()[2:]))(f)
+            print('f:', f)
+            x.append(f)
 
-    initial_state = x[0]
-    for i in range(2):
-        if con_merge_type == 'parallel':
-            merge_1 = KL.Lambda(lambda t: tf.stack([*t], axis=1))([initial_state, x[1]])
-            merge_2 = KL.Lambda(lambda t: tf.stack([*t], axis=1))([initial_state, x[2]])
-            merge_3 = KL.Lambda(lambda t: tf.stack([*t], axis=1))([initial_state, x[3]])
-            merge_1 = KL.ConvLSTM2D(256, (3, 3),
-                                    return_sequences=False, padding='SAME', name='tsr_mask_p1_' + str(i))(merge_1)
-            merge_2 = KL.ConvLSTM2D(256, (3, 3),
-                                    return_sequences=False, padding='SAME', name='tsr_mask_p2_' + str(i))(merge_2)
-            merge_3 = KL.ConvLSTM2D(256, (3, 3),
-                                    return_sequences=False, padding='SAME', name='tsr_mask_p3_' + str(i))(merge_3)
-            if con_pooling_type == 'ave':
-                # 第一种pooling，取平均
-                initial_state = KL.Average()([merge_1, merge_2, merge_3])
+        initial_state = x[0]
+        for i in range(2):
+            if con_merge_type == 'parallel':
+                merge_1 = KL.Lambda(lambda t: tf.stack([*t], axis=1))([initial_state, x[1]])
+                merge_2 = KL.Lambda(lambda t: tf.stack([*t], axis=1))([initial_state, x[2]])
+                merge_3 = KL.Lambda(lambda t: tf.stack([*t], axis=1))([initial_state, x[3]])
+                merge_1 = KL.ConvLSTM2D(256, (3, 3),
+                                        return_sequences=False, padding='SAME', name='tsr_mask_p1_' + str(i))(merge_1)
+                merge_2 = KL.ConvLSTM2D(256, (3, 3),
+                                        return_sequences=False, padding='SAME', name='tsr_mask_p2_' + str(i))(merge_2)
+                merge_3 = KL.ConvLSTM2D(256, (3, 3),
+                                        return_sequences=False, padding='SAME', name='tsr_mask_p3_' + str(i))(merge_3)
+                if con_pooling_type == 'ave':
+                    # 第一种pooling，取平均
+                    initial_state = KL.Average()([merge_1, merge_2, merge_3])
+                else:
+                    # 第二种pooling，取最值
+                    initial_state = KL.Multiply()([merge_1, merge_2, merge_3])
             else:
-                # 第二种pooling，取最值
-                initial_state = KL.Multiply()([merge_1, merge_2, merge_3])
-        else:
-            merge = KL.Lambda(lambda t: tf.stack([*t], axis=1))([initial_state, x[1], x[2], x[3]])
-            initial_state = KL.ConvLSTM2D(256, (3, 3),
-                                          return_sequences=False, padding='SAME', name='tsr-mask_up_' + str(i))(merge)
-    ls_shape = [batch] + [num_rois] + x[0].get_shape().as_list()[1:]
-    lstm = KL.Lambda(lambda t: tf.reshape(t, ls_shape))(initial_state)
-    print('lstm:', lstm)
+                merge = KL.Lambda(lambda t: tf.stack([*t], axis=1))([initial_state, x[1], x[2], x[3]])
+                initial_state = KL.ConvLSTM2D(256, (3, 3),
+                                              return_sequences=False, padding='SAME', name='tsr-mask_up_' + str(i))(merge)
+        ls_shape = [batch] + [num_rois] + x[0].get_shape().as_list()[1:]
+        lstm = KL.Lambda(lambda t: tf.reshape(t, ls_shape))(initial_state)
+        print('lstm:', lstm)
+    else:
+        lstm = PyramidROIAlign([pool_size, pool_size],
+                        name="roi_align_mask")([rois, image_meta] + feature_maps)
     # Conv layers
     x = KL.TimeDistributed(KL.Conv2D(256, (3, 3), padding="same"),
                            name="mrcnn_mask_conv")(lstm)
@@ -2231,7 +2229,6 @@ class MaskRCNN():
 
         mrcnn_feature_maps = rpn_feature_maps[:4]
 
-
         # Anchors
         if mode == "training":
             anchors = self.get_anchors(config.IMAGE_SHAPE)
@@ -2517,7 +2514,7 @@ class MaskRCNN():
         """
         # Print message on the first call (but not on recursive calls)
         if verbose > 0 and keras_model is None:
-            log("Selecting layers to train")
+            log("Selecting layers to train1708")
 
         keras_model = keras_model or self.keras_model
 
