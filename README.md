@@ -6,6 +6,7 @@
 TRAIN
 
 python demo.py train --dataset=/path/to/dataset --weights=coco
+
 python demo.py train --dataset=/path/to/dataset --weights=/path/to/weights
 
 INFERENCE
