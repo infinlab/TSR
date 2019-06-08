@@ -11,6 +11,6 @@ python demo.py train --dataset=/path/to/dataset --weights=/path/to/weights
 
 INFERENCE
 
-python demo.py train --dataset=/path/to/dataset --weights=/path/to/inference
+python demo.py train --image=/path/to/dataset --weights=/path/to/inference
 
 
